@@ -1,0 +1,21 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# AGP/CMake native build staging (Ninja files, build_command.txt, fastdds-prefix install tree)
+app/.cxx/
+
+# Fast DDS-Gen jar and any other downloaded tooling caches
+tools/.cache/

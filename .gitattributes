@@ -1,0 +1,17 @@
+# Normalize all text files to LF in the repository; check out as-is locally.
+* text=auto
+
+# Windows scripts must keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Unix scripts must keep LF.
+gradlew text eol=lf
+
+# Binary assets - never normalize.
+*.png binary
+*.jpg binary
+*.jar binary
+*.so binary
+*.apk binary
+*.keystore binary

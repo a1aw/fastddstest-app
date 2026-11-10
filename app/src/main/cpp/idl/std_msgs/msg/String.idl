@@ -1,0 +1,1 @@
+module std_msgs { module msg { struct String { string data; }; }; };
