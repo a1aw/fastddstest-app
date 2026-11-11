@@ -133,6 +133,56 @@
             android:minHeight="48dp" />
     </LinearLayout>
 
+    <LinearLayout
+        android:id="@+id/rateRow"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/domainRow">
+
+        <TextView
+            android:layout_width="96dp"
+            android:layout_height="wrap_content"
+            android:text="Rate Hz" />
+
+        <EditText
+            android:id="@+id/rateHz"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:hint="100 (0 = off)"
+            android:importantForAutofill="no"
+            android:inputType="number"
+            android:maxLines="1"
+            android:minHeight="48dp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/continuousRow"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/rateRow">
+
+        <Button
+            android:id="@+id/continuousButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Start continuous publish" />
+
+    </LinearLayout>
+
     <Button
         android:id="@+id/applyButton"
         android:layout_width="0dp"
@@ -143,7 +193,7 @@
         android:text="Apply and restart"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toBottomOf="@id/domainRow" />
+        app:layout_constraintTop_toBottomOf="@id/continuousRow" />
 
     <EditText
         android:id="@+id/messageInput"

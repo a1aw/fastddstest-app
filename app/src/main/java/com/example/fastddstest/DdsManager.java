@@ -69,6 +69,14 @@ public final class DdsManager {
     private static final String KEY_MODE = "mode";
     private static final String KEY_SERVER_HOST = "serverHost";
     private static final String KEY_SERVER_PORT = "serverPort";
+    private static final String KEY_RATE_HZ = "rateHz";
+
+    // RTT measurement: every continuous sample is "RTT <seq> <nanos>"; the responder
+    // appends " ~E" so the app can distinguish the echoed copy (the true RTT) from the
+    // local loopback copy the app's own reader receives right after the write.
+    static final String RTT_PREFIX = "RTT ";
+    static final String RTT_ECHO_MARKER = " ~E";
+    private static final int RTT_MAX_OUTSTANDING = 4096;
 
     private static final long PEER_POLL_PERIOD_S = 5L;
 
@@ -93,24 +101,42 @@ public final class DdsManager {
         public static final int DEFAULT_DOMAIN_ID = 0;
         public static final int DEFAULT_SERVER_PORT = 11811;
         public static final String DEFAULT_SERVER_HOST = "";
+        public static final int RATE_HZ_MAX = 1000;
+        public static final int DEFAULT_RATE_HZ = 0;
 
         public final int domainId;
         public final int mode;
         public final String serverHost;
         public final int serverPort;
 
+        /** Continuous publishing rate in Hz. 0 = off (manual send only). */
+        public final int rateHz;
+
         public Config(int domainId, int mode, String serverHost, int serverPort) {
+            this(domainId, mode, serverHost, serverPort, DEFAULT_RATE_HZ);
+        }
+
+        public Config(int domainId, int mode, String serverHost, int serverPort, int rateHz) {
             this.domainId = clamp(domainId);
             this.mode = (mode == DdsBridge.MODE_DISCOVERY_SERVER)
                     ? DdsBridge.MODE_DISCOVERY_SERVER
                     : DdsBridge.MODE_SIMPLE;
             this.serverHost = (serverHost == null) ? DEFAULT_SERVER_HOST : serverHost.trim();
             this.serverPort = (serverPort < 1 || serverPort > 65535) ? DEFAULT_SERVER_PORT : serverPort;
+            this.rateHz = clampRate(rateHz);
         }
 
         public static Config defaults() {
             return new Config(DEFAULT_DOMAIN_ID, DdsBridge.MODE_SIMPLE, DEFAULT_SERVER_HOST,
-                    DEFAULT_SERVER_PORT);
+                    DEFAULT_SERVER_PORT, DEFAULT_RATE_HZ);
+        }
+
+        /** Clamps a rate into {@code 0..1000} Hz; 0 disables continuous publishing. */
+        private static int clampRate(int value) {
+            if (value < 0) {
+                return 0;
+            }
+            return Math.min(value, RATE_HZ_MAX);
         }
 
         public boolean isDiscoveryServer() {
@@ -128,7 +154,8 @@ public final class DdsManager {
         /** Log/UI helper: one line describing the effective settings. */
         public String describe() {
             return "domain=" + domainId + " mode=" + modeName(mode)
-                    + (isDiscoveryServer() ? " server=" + serverEndpoint() : "");
+                    + (isDiscoveryServer() ? " server=" + serverEndpoint() : "")
+                    + (rateHz > 0 ? " rate=" + rateHz + "Hz" : "");
         }
 
         @NonNull
@@ -160,6 +187,128 @@ public final class DdsManager {
     private long readerHandle;
     private Config runningConfig;
     private ScheduledFuture<?> peerPoll;
+    private ScheduledFuture<?> continuousPublish;
+
+    /**
+     * RTT bookkeeping. Pings are registered on the executor thread (send) and matched
+     * on the DDS listener thread (echo), so the outstanding map is a ConcurrentHashMap
+     * and the aggregate stats are guarded by a lock.
+     */
+    private static final class RttTracker {
+        private final java.util.concurrent.ConcurrentHashMap<Integer, Long> outstanding =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        private final java.util.concurrent.atomic.AtomicLong seq = new java.util.concurrent.atomic.AtomicLong();
+        private final Object lock = new Object();
+
+        private long count;
+        private long totalNs;
+        private long minNs = Long.MAX_VALUE;
+        private long maxNs;
+        private long lastNs;
+        private long lastSeq = -1;
+
+        /** Registers a ping and returns its sequence number. */
+        int register(long sentNanos) {
+            final int id = (int) (seq.incrementAndGet() & 0x7fffffff);
+            outstanding.put(id, sentNanos);
+            if (outstanding.size() > RTT_MAX_OUTSTANDING) {
+                // Drop the oldest entries when pings are piling up (no responder running).
+                int dropped = 0;
+                for (Integer key : outstanding.keySet()) {
+                    if (outstanding.remove(key) != null) {
+                        if (++dropped >= RTT_MAX_OUTSTANDING / 2) {
+                            break;
+                        }
+                    }
+                }
+            }
+            return id;
+        }
+
+        /** Matches an echo and updates the running stats. Returns the RTT in ns. */
+        long record(int id, long receivedNanos) {
+            final Long original = outstanding.remove(id);
+            if (original == null) {
+                return -1;
+            }
+            final long rtt = receivedNanos - original;
+            synchronized (lock) {
+                count++;
+                totalNs += rtt;
+                if (rtt < minNs) {
+                    minNs = rtt;
+                }
+                if (rtt > maxNs) {
+                    maxNs = rtt;
+                }
+                lastNs = rtt;
+                lastSeq = id;
+            }
+            return rtt;
+        }
+
+        /** Read-only snapshot for the UI. */
+        Snapshot snapshot() {
+            synchronized (lock) {
+                return new Snapshot(count, totalNs, minNs, maxNs, lastNs, lastSeq, outstanding.size());
+            }
+        }
+
+        /** Immutable aggregate view of the RTT stats. */
+        static final class Snapshot {
+            final long count;
+            final long totalNs;
+            final long minNs;
+            final long maxNs;
+            final long lastNs;
+            final long lastSeq;
+            final int outstandingPings;
+
+            Snapshot(long count, long totalNs, long minNs, long maxNs, long lastNs,
+                    long lastSeq, int outstandingPings) {
+                this.count = count;
+                this.totalNs = totalNs;
+                this.minNs = minNs;
+                this.maxNs = maxNs;
+                this.lastNs = lastNs;
+                this.lastSeq = lastSeq;
+                this.outstandingPings = outstandingPings;
+            }
+
+            double avgMs() {
+                return (count == 0) ? 0 : (totalNs / (double) count) / 1_000_000.0;
+            }
+
+            double minMs() {
+                return (count == 0) ? 0 : minNs / 1_000_000.0;
+            }
+
+            double maxMs() {
+                return (count == 0) ? 0 : maxNs / 1_000_000.0;
+            }
+
+            double lastMs() {
+                return (count == 0) ? 0 : lastNs / 1_000_000.0;
+            }
+
+            private static String format(double v) {
+                return String.format(java.util.Locale.US, "%.2f", v);
+            }
+
+            @Override
+            public String toString() {
+                return "RTT n=" + count + " avg=" + format(avgMs()) + "ms min=" + format(minMs())
+                        + " max=" + format(maxMs()) + " last=" + format(lastMs())
+                        + " seq=" + lastSeq + " pending=" + outstandingPings;
+            }
+        }
+    }
+
+    private final RttTracker rttTracker = new RttTracker();
+
+    // ---- Continuous publish rate reporting. Executor thread only. ----
+    private long txCount;
+    private long lastTxReportNs;
 
     /**
      * Mirrored for {@link #isRunning()}, which is called from the main thread. It flips to
@@ -224,6 +373,91 @@ public final class DdsManager {
     /** Reflects the last completed start/stop; may lag a queued call by one executor turn. */
     public boolean isRunning() {
         return running;
+    }
+
+    // ------------------------------------------------------------------ continuous publish
+
+    /** True while the continuous publisher is running. Main thread only. */
+    public boolean isContinuousPublishing() {
+        return continuousPublishing;
+    }
+
+    /**
+     * Starts continuous publishing at {@code rateHz} samples per second, writing
+     * {@code RTT <seq> <nanos>} so the RTT tracker can match the echo. No-op when already
+     * running or when the participant is not up (the task is queued, so it picks up as soon
+     * as start() completes).
+     */
+    public void startContinuousPublishing(final int rateHz) {
+        executor.execute(() -> {
+            if (continuousPublishing) {
+                postStatus("Continuous publish already running");
+                return;
+            }
+            final int clamped = (rateHz < 1) ? 1 : Math.min(rateHz, Config.RATE_HZ_MAX);
+            final long periodNs = 1_000_000_000L / clamped;
+            postStatus("Continuous publish: " + clamped + " Hz (" + periodNs + " ns period)");
+            continuousPublishing = true;
+            // Fixed delay (not fixed rate) is lint-clean and keeps up under load; the
+            // effective rate is measured from the sent timestamps, not the schedule.
+            continuousPublish = executor.scheduleWithFixedDelay(
+                    this::publishContinuousSample, periodNs, periodNs, TimeUnit.NANOSECONDS);
+        });
+    }
+
+    /** Stops the continuous publisher. No-op when not running. */
+    public void stopContinuousPublishing() {
+        executor.execute(() -> {
+            if (!continuousPublishing) {
+                return;
+            }
+            if (continuousPublish != null) {
+                continuousPublish.cancel(false);
+                continuousPublish = null;
+            }
+            continuousPublishing = false;
+            postStatus("Continuous publish stopped");
+        });
+    }
+
+    /** Reflects the last start/stop of the continuous publisher (main thread only). */
+    private volatile boolean continuousPublishing;
+
+    /** Executor thread only. One continuous publish tick. */
+    private void publishContinuousSample() {
+        if (!running || writerHandle == 0) {
+            return;
+        }
+        final long sentNanos = System.nanoTime();
+        final int id = rttTracker.register(sentNanos);
+        final String payload = RTT_PREFIX + id + " " + sentNanos;
+        try {
+            if (!DdsBridge.nativeWriteString(writerHandle, payload)) {
+                postError("nativeWriteString failed (continuous): " + payload);
+            }
+        } catch (Throwable t) {
+            postError("nativeWriteString failed (continuous): " + t);
+        }
+
+        // One status line per second so the effective rate is observable in the UI.
+        txCount++;
+        final long now = System.nanoTime();
+        if (lastTxReportNs == 0) {
+            lastTxReportNs = now;
+        } else if (now - lastTxReportNs >= 1_000_000_000L) {
+            final double hz = txCount / ((now - lastTxReportNs) / 1_000_000_000.0);
+            lastTxReportNs = now;
+            txCount = 0;
+            postStatus(String.format(java.util.Locale.US, "Publishing %.1f Hz", hz));
+        }
+    }
+
+    /**
+     * Returns the current RTT snapshot (main thread only). The snapshot is a
+     * plain value object; the tracker keeps running.
+     */
+    public RttTracker.Snapshot rttSnapshot() {
+        return rttTracker.snapshot();
     }
 
     /**
@@ -319,6 +553,11 @@ public final class DdsManager {
      */
     private void teardown() {
         cancelPeerPoll();
+        if (continuousPublish != null) {
+            continuousPublish.cancel(false);
+            continuousPublish = null;
+            continuousPublishing = false;
+        }
 
         if (writerHandle != 0) {
             try {
@@ -441,7 +680,8 @@ public final class DdsManager {
                 prefs.getInt(KEY_DOMAIN_ID, Config.DEFAULT_DOMAIN_ID),
                 prefs.getInt(KEY_MODE, DdsBridge.MODE_SIMPLE),
                 prefs.getString(KEY_SERVER_HOST, Config.DEFAULT_SERVER_HOST),
-                prefs.getInt(KEY_SERVER_PORT, Config.DEFAULT_SERVER_PORT));
+                prefs.getInt(KEY_SERVER_PORT, Config.DEFAULT_SERVER_PORT),
+                prefs.getInt(KEY_RATE_HZ, Config.DEFAULT_RATE_HZ));
         Log.i(TAG, "load " + config.describe());
         return config;
     }
@@ -453,6 +693,7 @@ public final class DdsManager {
                 .putInt(KEY_MODE, cfg.mode)
                 .putString(KEY_SERVER_HOST, cfg.serverHost)
                 .putInt(KEY_SERVER_PORT, cfg.serverPort)
+                .putInt(KEY_RATE_HZ, cfg.rateHz)
                 .apply();
         Log.i(TAG, "save " + cfg.describe());
     }
@@ -460,6 +701,26 @@ public final class DdsManager {
     // ------------------------------------------------------------------ main thread delivery
 
     private void postSample(String topic, String data) {
+        // RTT echo matching: an echo of one of our pings is "<payload> ~E" and the
+        // payload is "RTT <seq> <nanos>". The local loopback copy (no marker) is
+        // deliberately ignored - it says nothing about the network.
+        if (data.startsWith(RTT_PREFIX)) {
+            final String payload = data.endsWith(RTT_ECHO_MARKER)
+                    ? data.substring(0, data.length() - RTT_ECHO_MARKER.length())
+                    : data;
+            final String[] parts = payload.split(" ");
+            if (parts.length == 3 && data.endsWith(RTT_ECHO_MARKER)) {
+                try {
+                    final int id = Integer.parseInt(parts[1]);
+                    final long rtt = rttTracker.record(id, System.nanoTime());
+                    if (rtt >= 0) {
+                        postStatus(rttTracker.snapshot().toString());
+                    }
+                } catch (NumberFormatException ignored) {
+                    // Not one of our pings - deliver as a normal sample.
+                }
+            }
+        }
         mainHandler.post(() -> {
             if (listener != null) {
                 listener.onSample(topic, data);

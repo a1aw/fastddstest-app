@@ -85,6 +85,7 @@ public class MainActivity extends AppCompatActivity implements DdsManager.Listen
         setupDiscoveryModeSpinner();
         binding.applyButton.setOnClickListener(v -> onApplyClicked());
         binding.sendButton.setOnClickListener(v -> onSendClicked());
+        binding.continuousButton.setOnClickListener(v -> onContinuousClicked());
 
         config = DdsManager.load(this);
         bindConfigToUi(config);
@@ -196,6 +197,7 @@ public class MainActivity extends AppCompatActivity implements DdsManager.Listen
         binding.serverAddress.setText(cfg.serverHost);
         binding.serverPort.setText(String.valueOf(cfg.serverPort));
         binding.domainId.setText(String.valueOf(cfg.domainId));
+        binding.rateHz.setText(String.valueOf(cfg.rateHz));
         updateServerFieldsEnabled();
         updateStatusHeader();
     }
@@ -234,7 +236,8 @@ public class MainActivity extends AppCompatActivity implements DdsManager.Listen
                         ? DdsBridge.MODE_DISCOVERY_SERVER
                         : DdsBridge.MODE_SIMPLE,
                 binding.serverAddress.getText().toString(),
-                parseIntField(binding.serverPort, DdsManager.Config.DEFAULT_SERVER_PORT, "server port"));
+                parseIntField(binding.serverPort, DdsManager.Config.DEFAULT_SERVER_PORT, "server port"),
+                parseIntField(binding.rateHz, DdsManager.Config.DEFAULT_RATE_HZ, "rate Hz"));
 
         config = updated;
         DdsManager.save(this, updated);
@@ -265,6 +268,25 @@ public class MainActivity extends AppCompatActivity implements DdsManager.Listen
         binding.messageInput.setText("");
     }
 
+    private void onContinuousClicked() {
+        if (ddsManager == null) {
+            return;
+        }
+        if (ddsManager.isContinuousPublishing()) {
+            ddsManager.stopContinuousPublishing();
+            binding.continuousButton.setText("Start continuous publish");
+        } else {
+            final int rate = parseIntField(binding.rateHz, DdsManager.Config.DEFAULT_RATE_HZ,
+                    "rate Hz");
+            if (rate < 1) {
+                appendLog("Rate Hz must be 1..1000 to start continuous publish.");
+                return;
+            }
+            ddsManager.startContinuousPublishing(rate);
+            binding.continuousButton.setText("Stop continuous publish");
+        }
+    }
+
     private int parseIntField(@NonNull EditText field, int fallback, String label) {
         String raw = field.getText().toString().trim();
         if (raw.isEmpty()) {
@@ -282,6 +304,14 @@ public class MainActivity extends AppCompatActivity implements DdsManager.Listen
 
     @Override
     public void onSample(String topic, String data) {
+        if (data.startsWith(DdsManager.RTT_PREFIX)) {
+            // The RTT stats line itself carries the aggregate; keep the log readable
+            // by logging only the echoed copy (the network RTT), not the local loopback.
+            if (data.endsWith(DdsManager.RTT_ECHO_MARKER)) {
+                appendLog("RX [" + topic + "] " + data + "  (echo)");
+            }
+            return;
+        }
         appendLog("RX [" + topic + "] " + data);
     }
 
