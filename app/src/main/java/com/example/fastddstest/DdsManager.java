@@ -398,11 +398,43 @@ public final class DdsManager {
             final long periodNs = 1_000_000_000L / clamped;
             postStatus("Continuous publish: " + clamped + " Hz (" + periodNs + " ns period)");
             continuousPublishing = true;
-            // Fixed delay (not fixed rate) is lint-clean and keeps up under load; the
-            // effective rate is measured from the sent timestamps, not the schedule.
+            // Deadline-based loop instead of scheduleWithFixedDelay: fixed delay adds the
+            // write duration on top of the period (100 Hz came out ~89 Hz because
+            // nativeWriteString takes ~1.2 ms), and fixed rate bursts when a tick overruns.
+            // Scheduling the next tick from the previous tick's deadline compensates for
+            // the write time and holds the nominal rate.
             continuousPublish = executor.scheduleWithFixedDelay(
-                    this::publishContinuousSample, periodNs, periodNs, TimeUnit.NANOSECONDS);
+                    this::publishLoop, 0, 1, TimeUnit.MILLISECONDS);
+            publishPeriodNs = periodNs;
         });
+    }
+
+    /** Stop flag + tick spacing for the deadline loop. Executor thread only. */
+    private volatile long publishPeriodNs;
+
+    /** Executor thread only. Deadline-based publish loop; runs until cancelled. */
+    private void publishLoop() {
+        final long periodNs = publishPeriodNs;
+        if (periodNs <= 0) {
+            return;
+        }
+        long nextTick = System.nanoTime();
+        while (continuousPublishing) {
+            publishContinuousSample();
+            nextTick += periodNs;
+            final long sleepNs = nextTick - System.nanoTime();
+            if (sleepNs > 0) {
+                try {
+                    TimeUnit.NANOSECONDS.sleep(sleepNs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            } else {
+                // Fell behind (write overran the period): resync instead of bursting.
+                nextTick = System.nanoTime();
+            }
+        }
     }
 
     /** Stops the continuous publisher. No-op when not running. */
@@ -411,11 +443,11 @@ public final class DdsManager {
             if (!continuousPublishing) {
                 return;
             }
+            continuousPublishing = false;
             if (continuousPublish != null) {
                 continuousPublish.cancel(false);
                 continuousPublish = null;
             }
-            continuousPublishing = false;
             postStatus("Continuous publish stopped");
         });
     }
