@@ -398,14 +398,16 @@ public final class DdsManager {
             final long periodNs = 1_000_000_000L / clamped;
             postStatus("Continuous publish: " + clamped + " Hz (" + periodNs + " ns period)");
             continuousPublishing = true;
+            publishPeriodNs = periodNs;
             // Deadline-based loop instead of scheduleWithFixedDelay: fixed delay adds the
             // write duration on top of the period (100 Hz came out ~89 Hz because
             // nativeWriteString takes ~1.2 ms), and fixed rate bursts when a tick overruns.
             // Scheduling the next tick from the previous tick's deadline compensates for
-            // the write time and holds the nominal rate.
+            // the write time and holds the nominal rate. The loop blocks this executor
+            // thread until stopContinuousPublishing() clears the flag, which is why the
+            // flag is cleared on the caller's thread (see that method).
             continuousPublish = executor.scheduleWithFixedDelay(
                     this::publishLoop, 0, 1, TimeUnit.MILLISECONDS);
-            publishPeriodNs = periodNs;
         });
     }
 
@@ -439,11 +441,14 @@ public final class DdsManager {
 
     /** Stops the continuous publisher. No-op when not running. */
     public void stopContinuousPublishing() {
+        // The flag MUST be cleared on the calling thread, not inside the executor:
+        // publishLoop() runs on the single-threaded executor and only exits once the
+        // flag drops. Clearing it from a queued task would deadlock - that task can
+        // never start while the loop is sleeping, and the loop never sees the flag.
+        // Clearing here lets the sleeping loop wake up, observe false, and return;
+        // the queued cancel then just reaps the future.
+        continuousPublishing = false;
         executor.execute(() -> {
-            if (!continuousPublishing) {
-                return;
-            }
-            continuousPublishing = false;
             if (continuousPublish != null) {
                 continuousPublish.cancel(false);
                 continuousPublish = null;
